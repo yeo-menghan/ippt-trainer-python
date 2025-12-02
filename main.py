@@ -1,6 +1,9 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import pyttsx3
+from threading import Thread
+import queue
 
 class ExerciseDetector:
     def __init__(self):
@@ -16,6 +19,36 @@ class ExerciseDetector:
         self.situp_count = 0
         self.pushup_stage = None
         self.situp_stage = None
+        
+        # Feedback flags to avoid repetitive warnings
+        self.last_feedback = ""
+        self.feedback_cooldown = 0
+        
+        # Initialize text-to-speech engine in a separate thread
+        self.tts_queue = queue.Queue()
+        self.tts_thread = Thread(target=self._tts_worker, daemon=True)
+        self.tts_thread.start()
+        
+    def _tts_worker(self):
+        """Worker thread for text-to-speech to avoid blocking main loop"""
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 150)  # Speed of speech
+        engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
+        
+        while True:
+            text = self.tts_queue.get()
+            if text is None:  # Poison pill to stop thread
+                break
+            engine.say(text)
+            engine.runAndWait()
+            
+    def speak(self, text):
+        """Add text to speech queue"""
+        # Only speak if it's different from last feedback (avoid spam)
+        if text != self.last_feedback or self.feedback_cooldown == 0:
+            self.tts_queue.put(text)
+            self.last_feedback = text
+            self.feedback_cooldown = 30  # Frames to wait before repeating same feedback
         
     def calculate_angle(self, a, b, c):
         """Calculate angle between three points"""
@@ -52,12 +85,35 @@ class ExerciseDetector:
         # Check if body is straight (proper plank position)
         body_straight = 160 < body_angle < 200
         
-        # Push-up logic
-        if elbow_angle > 160 and body_straight:
-            self.pushup_stage = "up"
-        if elbow_angle < 90 and self.pushup_stage == "up" and body_straight:
-            self.pushup_stage = "down"
-            self.pushup_count += 1
+        # Decrease feedback cooldown
+        if self.feedback_cooldown > 0:
+            self.feedback_cooldown -= 1
+        
+        # Push-up logic with audio feedback
+        if elbow_angle > 160:
+            if body_straight:
+                self.pushup_stage = "up"
+            else:
+                # Body not straight in up position
+                if self.feedback_cooldown == 0:
+                    self.speak("Straighten body")
+                    
+        elif elbow_angle < 90 and self.pushup_stage == "up":
+            if body_straight:
+                self.pushup_stage = "down"
+                self.pushup_count += 1
+                # Announce the count
+                self.speak(str(self.pushup_count))
+                self.last_feedback = ""  # Reset to allow other feedback
+            else:
+                # Body not straight while going down
+                if self.feedback_cooldown == 0:
+                    self.speak("Straighten body")
+                    
+        elif 90 <= elbow_angle <= 160 and self.pushup_stage == "up":
+            # In the lowering phase but not deep enough
+            if elbow_angle > 110 and self.feedback_cooldown == 0:
+                self.speak("Go lower")
             
         return elbow_angle, body_angle, body_straight
     
@@ -72,23 +128,54 @@ class ExerciseDetector:
                landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE.value].y]
         ankle = [landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
                 landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
+        elbow = [landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW.value].x,
+                landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
         
-        # Calculate angle at hip
+        # Calculate angles
         hip_angle = self.calculate_angle(shoulder, hip, knee)
         knee_angle = self.calculate_angle(hip, knee, ankle)
         
-        # Sit-up logic
+        # Calculate distance between elbow and knee (for touch detection)
+        elbow_knee_distance = np.sqrt((elbow[0] - knee[0])**2 + (elbow[1] - knee[1])**2)
+        
+        # Decrease feedback cooldown
+        if self.feedback_cooldown > 0:
+            self.feedback_cooldown -= 1
+        
+        # Sit-up logic with audio feedback
         if hip_angle < 50:  # Sitting up position
-            self.situp_stage = "up"
-        if hip_angle > 120 and self.situp_stage == "up":  # Lying down position
-            self.situp_stage = "down"
-            self.situp_count += 1
+            # Check if elbow touched knee (distance threshold)
+            if elbow_knee_distance < 0.15:  # Threshold for "touch" (normalized coordinates)
+                if self.situp_stage == "down":
+                    self.situp_stage = "up"
+            else:
+                # Not going high enough
+                if self.situp_stage == "down" and self.feedback_cooldown == 0:
+                    self.speak("Go higher")
+                    
+        elif hip_angle > 140:  # Lying down position (stricter than before)
+            if self.situp_stage == "up":
+                self.situp_stage = "down"
+                self.situp_count += 1
+                # Announce the count
+                self.speak(str(self.situp_count))
+                self.last_feedback = ""  # Reset to allow other feedback
+            elif self.situp_stage is None:
+                self.situp_stage = "down"
+                
+        elif 120 <= hip_angle <= 140 and self.situp_stage == "up":
+            # Not lying down fully
+            if self.feedback_cooldown == 0:
+                self.speak("Lie flat down")
             
-        return hip_angle, knee_angle
+        return hip_angle, knee_angle, elbow_knee_distance
     
     def run(self, exercise_type='pushup'):
         """Run the exercise detector"""
         cap = cv2.VideoCapture(0)
+        
+        # Welcome message
+        self.speak(f"Starting {exercise_type} mode")
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -123,12 +210,12 @@ class ExerciseDetector:
                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     cv2.putText(image, f'Body Angle: {int(body_angle)}', 
                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.putText(image, f'Form: {"Good" if body_straight else "Keep body straight!"}', 
+                    cv2.putText(image, f'Form: {"Good" if body_straight else "Straighten body!"}', 
                                (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
                                (0, 255, 0) if body_straight else (0, 0, 255), 2)
                     
                 elif exercise_type == 'situp':
-                    hip_angle, knee_angle = self.detect_situp(landmarks)
+                    hip_angle, knee_angle, elbow_knee_dist = self.detect_situp(landmarks)
                     
                     # Display info
                     cv2.putText(image, f'Sit-ups: {self.situp_count}', 
@@ -137,6 +224,8 @@ class ExerciseDetector:
                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     cv2.putText(image, f'Knee Angle: {int(knee_angle)}', 
                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(image, f'Elbow-Knee Dist: {elbow_knee_dist:.2f}', 
+                               (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
                 # Draw pose landmarks
                 self.mp_drawing.draw_landmarks(
@@ -150,8 +239,8 @@ class ExerciseDetector:
             # Display instructions
             cv2.putText(image, f'Mode: {exercise_type.upper()}', 
                        (10, image.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.putText(image, 'Press P for Push-ups | S for Sit-ups | Q to Quit', 
-                       (10, image.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(image, 'Press P for Push-ups | S for Sit-ups | R to Reset | Q to Quit', 
+                       (10, image.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             cv2.imshow('Exercise Pose Detector', image)
             
@@ -160,15 +249,23 @@ class ExerciseDetector:
             if key == ord('q'):
                 break
             elif key == ord('p'):
-                exercise_type = 'pushup'
+                if exercise_type != 'pushup':
+                    exercise_type = 'pushup'
+                    self.speak("Push-up mode")
             elif key == ord('s'):
-                exercise_type = 'situp'
+                if exercise_type != 'situp':
+                    exercise_type = 'situp'
+                    self.speak("Sit-up mode")
             elif key == ord('r'):  # Reset counter
                 if exercise_type == 'pushup':
                     self.pushup_count = 0
+                    self.speak("Push-up counter reset")
                 else:
                     self.situp_count = 0
+                    self.speak("Sit-up counter reset")
         
+        # Cleanup
+        self.tts_queue.put(None)  # Stop TTS thread
         cap.release()
         cv2.destroyAllWindows()
 
